@@ -1,0 +1,7 @@
+.cursorrules
+.vscode/
+.clangd
+out/
+simulations/results/
+my-leo
+Makefile
