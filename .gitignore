@@ -3,5 +3,6 @@
 .clangd
 out/
 simulations/results/
+simulations/.qtenvrc
 my-leo
 Makefile
