@@ -13,21 +13,18 @@ void Satellite::initialize() {
 
   satelliteId = par("satelliteId").intValue();
 
-  orbitParams.altitude = par("altitude");
+  orbitParams.semiMajorAxis = EARTH_RADIUS + par("altitude").doubleValue();
   orbitParams.inclination = par("inclination");
-  orbitParams.period = par("period");
-  orbitParams.initialAngle = par("initialAngle");
+  orbitParams.raan = par("raan");
+  orbitParams.argPerigee = par("argPerigee");
+  orbitParams.trueAnomaly = par("initialAngle");
+  orbitParams.eccentricity = par("eccentricity");
 
   maxISLRange = par("maxISLRange");
 
-  currentPosition = updateLEOOrbit(orbitParams, 0.0);
+  currentPosition = calculateSatellitePositionECEF(orbitParams, 0.0);
   updateNeighborList();
   findNeighborSatellites();
-
-  if (satelliteId == 2 && !neighbors.empty()) {
-    cMessage *testMsg = new cMessage("Test from sat2 to sat3");
-    sendToNeighbor(neighbors[0].module, testMsg);
-  }
 
   EV << "Satellite " << satelliteId << " initial position: ("
      << currentPosition.x << ", " << currentPosition.y << ", "
@@ -35,6 +32,10 @@ void Satellite::initialize() {
 
   updateTimer = new cMessage("updatePosition");
   scheduleAt(simTime() + 1.0, updateTimer);
+
+  // Start traffic generation
+  trafficTimer = new cMessage("generateTraffic");
+  scheduleAt(simTime() + par("sendInterval"), trafficTimer);
 
   endToEndDelay = new cOutVector("endToEndDelay");
   hopCountVector = new cOutVector("hopCount");
@@ -52,10 +53,15 @@ void Satellite::handleMessage(cMessage *msg) {
 
     double simTimeSeconds = simTime().dbl();
 
-    currentPosition = updateLEOOrbit(orbitParams, simTimeSeconds);
+    currentPosition = calculateSatellitePositionECEF(orbitParams, simTimeSeconds);
 
-    getDisplayString().setTagArg("p", 0, (long)currentPosition.x);
-    getDisplayString().setTagArg("p", 1, (long)currentPosition.y);
+    // Update 2D Map Position (Mission Control View)
+    GeoCoord geo = ecefToGeo(currentPosition);
+    Position3D screenPos = geoToScreen(geo, 1000.0, 500.0);
+
+    getDisplayString().setTagArg("p", 0, (long)screenPos.x);
+    getDisplayString().setTagArg("p", 1, (long)screenPos.y);
+    // No Z needed for 2D map
 
     updateNeighborList();
     findNeighborSatellites();
@@ -65,6 +71,45 @@ void Satellite::handleMessage(cMessage *msg) {
        << endl;
 
     scheduleAt(simTime() + 1.0, updateTimer);
+  } else if (msg == trafficTimer) {
+    // 1. Create a new DataPacket
+    char pktName[32];
+    snprintf(pktName, sizeof(pktName), "Data-%d-%ld", satelliteId, packetsReceived + packetsForwarded + packetsDropped);
+    DataPacket *packet = new DataPacket(pktName);
+    packet->sourceId = satelliteId;
+    
+    // Pick a random destination from 1 to 6
+    // Ideally, we should detect the network size dynamically, but for now specific to 6 sats:
+    int dest = 1 + intuniform(0, 5); 
+    
+    while (dest == satelliteId) { // Don't send to self
+        dest = 1 + intuniform(0, 5);
+    }
+    packet->destinationId = dest;
+    packet->packetId = packetsForwarded + packetsReceived + 1000; // Unique ID simulation
+    
+    // 2. Route it
+    bool routeFound = false;
+    for (const auto &entry : routingTable) {
+        if (entry.destinationId == packet->destinationId) {
+            routeFound = true;
+            break;
+        }
+    }
+
+    if (routeFound) {
+        routeMessage(packet, packet->destinationId);
+        EV << "Satellite " << satelliteId << " GENERATED packet #" << packet->packetId 
+           << " to " << packet->destinationId << endl;
+    } else {
+        EV << "Satellite " << satelliteId << " COULD NOT ROUTE generated packet to " 
+           << packet->destinationId << " (no route)" << endl;
+        delete packet;
+    }
+
+    // 3. Reschedule
+    scheduleAt(simTime() + par("sendInterval"), trafficTimer);
+
   } else if (dynamic_cast<RoutingMessage *>(msg) != nullptr) {
     processRoutingMessage(check_and_cast<RoutingMessage *>(msg));
   } else if (dynamic_cast<DataPacket *>(msg) != nullptr) {
@@ -124,6 +169,9 @@ void Satellite::finish() {
   if (updateTimer) {
     cancelAndDelete(updateTimer);
   }
+  if (trafficTimer) {
+    cancelAndDelete(trafficTimer);
+  }
   // istatistics
   EV << "=== Satellite " << satelliteId << " Statistics ===" << endl;
   EV << "Packets Received: " << packetsReceived << endl;
@@ -171,12 +219,14 @@ double Satellite::calculateDistanceToSatellite(cModule *otherSatellite) const {
   Position3D myPos = currentPosition;
 
   OrbitParams otherParams;
-  otherParams.altitude = otherSatellite->par("altitude");
+  otherParams.semiMajorAxis = EARTH_RADIUS + otherSatellite->par("altitude").doubleValue();
   otherParams.inclination = otherSatellite->par("inclination");
-  otherParams.period = otherSatellite->par("period");
-  otherParams.initialAngle = otherSatellite->par("initialAngle");
+  otherParams.raan = otherSatellite->par("raan");
+  otherParams.argPerigee = otherSatellite->par("argPerigee");
+  otherParams.trueAnomaly = otherSatellite->par("initialAngle");
+  otherParams.eccentricity = otherSatellite->par("eccentricity");
 
-  Position3D otherPos = updateLEOOrbit(otherParams, simTime().dbl());
+  Position3D otherPos = calculateSatellitePositionECEF(otherParams, simTime().dbl());
 
   return calculateDistance(myPos, otherPos);
 }
@@ -184,37 +234,39 @@ double Satellite::calculateDistanceToSatellite(cModule *otherSatellite) const {
 void Satellite::updateNeighborList() {
   neighbors.clear();
 
-  cModule *network = getParentModule();
-  if (!network) {
-    EV << "ERROR: Network not found" << endl;
-    return;
+  // Iterate over all outgoing gates "radioOut$o"
+  int numGates = gateSize("radioOut$o");
+  
+  for (int i = 0; i < numGates; i++) {
+      // Get the gate and check where it connects to
+      cGate *outGate = gate("radioOut$o", i);
+      
+      if (!outGate->isConnected()) continue;
+
+      // Follow the link to find the destination module
+      // Note: Since we have channels (InterSatelliteLink), we need to follow through the channel
+      cGate *destGate = outGate->getPathEndGate();
+      cModule *destMod = destGate->getOwnerModule();
+
+      // Check if it is a Satellite
+      if (strcmp(destMod->getClassName(), "Satellite") == 0) {
+          double distance = calculateDistanceToSatellite(destMod);
+          
+          // Only add to routing table if within range (simulating link break)
+          if (distance <= maxISLRange) {
+              NeighborInfo neighbor;
+              neighbor.module = destMod;
+              neighbor.distance = distance;
+              neighbor.gateIndex = i; // The actual gate index!
+              neighbors.push_back(neighbor);
+          }
+      }
+      // Or GroundStation (Optional, usually we don't route THROUGH GS, but we can send TO GS)
+      else if (strcmp(destMod->getClassName(), "GroundStation") == 0) {
+           // We can track GS here too if needed, but usually GS initiates contact
+      }
   }
 
-  int gateIndex = 0;
-
-  for (cModule::SubmoduleIterator it(network); !it.end(); ++it) {
-    cModule *submod = *it;
-
-    if (submod == this || strcmp(submod->getClassName(), "Satellite") != 0) {
-      continue;
-    }
-    double distance = calculateDistanceToSatellite(submod);
-
-    if (distance <= maxISLRange) {
-      NeighborInfo neighbor;
-      neighbor.module = submod;
-      neighbor.distance = distance;
-      neighbor.gateIndex = gateIndex;
-
-      neighbors.push_back(neighbor);
-
-      EV << "Satellite " << satelliteId << " connected to "
-         << submod->par("satelliteId").intValue()
-         << " at distance: " << distance << " km" << endl;
-
-      gateIndex++;
-    }
-  }
   updateRoutingTable();
   broadcastRoutingTable();
 }

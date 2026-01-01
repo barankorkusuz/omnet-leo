@@ -10,9 +10,17 @@ Define_Module(GroundStation);
 
 void GroundStation::initialize() {
 
-  position.x = par("x");
-  position.y = par("y");
-  position.z = par("z");
+  GeoCoord geo;
+  geo.latitude = par("latitude");
+  geo.longitude = par("longitude");
+  geo.altitude = par("altitude");
+
+  position = geoToECEF(geo);
+
+  // Set initial 2D Map position
+  Position3D screenPos = geoToScreen(geo, 1000.0, 500.0);
+  getDisplayString().setTagArg("p", 0, (long)screenPos.x);
+  getDisplayString().setTagArg("p", 1, (long)screenPos.y);
 
   maxRange = par("maxRange");
   currentSatellite = nullptr;
@@ -51,7 +59,7 @@ void GroundStation::handleMessage(cMessage *msg) {
     performHandover();
     scheduleAt(simTime() + 5.0, handoverTimer);
   } else if (dynamic_cast<DataPacket *>(msg) != nullptr) {
-    // DataPacket alındı
+    // DataPacket received
     DataPacket *packet = check_and_cast<DataPacket *>(msg);
     packetsReceived++;
 
@@ -74,7 +82,7 @@ void GroundStation::finish() {
     cancelAndDelete(handoverTimer);
   }
 
-  // istatistics
+  // statistics
   EV << "=== GroundStation Statistics ===" << endl;
   EV << "Packets Sent: " << packetsSent << endl;
   EV << "Packets Received: " << packetsReceived << endl;
@@ -104,12 +112,14 @@ cModule *GroundStation::findNearestSatellite() const {
     }
 
     OrbitParams orbitParams;
-    orbitParams.altitude = submod->par("altitude");
+    orbitParams.semiMajorAxis = EARTH_RADIUS + submod->par("altitude").doubleValue();
     orbitParams.inclination = submod->par("inclination");
-    orbitParams.period = submod->par("period");
-    orbitParams.initialAngle = submod->par("initialAngle");
+    orbitParams.raan = submod->par("raan");
+    orbitParams.argPerigee = submod->par("argPerigee");
+    orbitParams.trueAnomaly = submod->par("initialAngle");
+    orbitParams.eccentricity = submod->par("eccentricity");
 
-    Position3D satPos = updateLEOOrbit(orbitParams, simTime().dbl());
+    Position3D satPos = calculateSatellitePositionECEF(orbitParams, simTime().dbl());
     double distance = calculateDistance(position, satPos);
 
     if (distance <= maxRange && distance < minDistance) {
@@ -153,6 +163,12 @@ void GroundStation::sendToCurrentSatellite(cMessage *msg) {
 }
 
 int GroundStation::getGateIndexForSatellite(cModule *satellite) const {
-  int satId = satellite->par("satelliteId").intValue();
-  return satId - 1;
+  int numGates = gateSize("groundLink$o");
+  for (int i = 0; i < numGates; i++) {
+      const cGate *outGate = gate("groundLink$o", i);
+      if (outGate->isConnected() && outGate->getPathEndGate()->getOwnerModule() == satellite) {
+          return i;
+      }
+  }
+  return -1; // Not found
 }

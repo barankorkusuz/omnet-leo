@@ -1,143 +1,111 @@
-simple Satellite{
+// --- Channels ---
+channel SatelliteToGroundLink extends ned.DatarateChannel {
     parameters:
-        int satelliteId;
-        double altitude @unit("km") = default(500km);
-        double inclination @unit("deg") = default(53deg);
-        double period @unit("s") = default(5676s);
-        double initialAngle @unit("deg") = default(0deg);
-        double maxISLRange @unit("km") = default(5000km);
-
-    gates:
-    inout radioIn[10];
-    inout radioOut[10];
+        double distance @unit("km") = default(500km);
+        double baseLatency @unit("ms") = default(2ms);
+        delay = (distance / 299792.458km) * 1s + baseLatency;
+        datarate = default(10Gbps);
 }
 
-simple InterSatelliteLink
-{
+channel InterSatelliteLink extends ned.DatarateChannel {
     parameters:
         double distance @unit("km") = default(1000km);
-        double dataRate @unit("Gbps") = default(10Gbps);
         double baseLatency @unit("ms") = default(5ms);
+        delay = (distance / 299792.458km) * 1s + baseLatency;
+        datarate = default(10Gbps);
+}
+
+// --- Modules ---
+simple Satellite{
+    parameters:
+        @display("i=device/satellite"); // Satellite icon
+        int satelliteId;
+        double altitude @unit("km") = default(500km);
+        double inclination @unit("deg") = default(53deg); // Starlink-ish
+        double raan @unit("deg") = default(0deg);
+        double argPerigee @unit("deg") = default(0deg);
+        double initialAngle @unit("deg") = default(0deg);
+        double eccentricity = default(0);
+        
+        double maxISLRange @unit("km") = default(5000km);
+        volatile double sendInterval @unit("s") = default(uniform(1s, 5s));
 
     gates:
-        input linkIn;
-        output linkOut;   
+        inout radioIn[];  // Dynamic gate array
+        inout radioOut[]; // Dynamic gate array
 }
 
 simple GroundStation
 {
     parameters:
-        double x @unit("km") = default(0km);
-        double y @unit("km") = default(0km);
-        double z @unit("km") = default(0km);
-
-        double maxRange @unit("km") = default(2000km);
+        @display("i=device/antennatower"); // More common antenna icon
+        string locationName = default("Unknown");
+        double latitude @unit("deg");
+        double longitude @unit("deg");
+        double altitude @unit("km") = default(0km);
+        double maxRange @unit("km") = default(2500km);
 
     gates:
-        inout groundLink[3];
-}
-
-simple SatelliteToGroundLink{
-    parameters:
-        double distance @unit("km") = default(500km);
-        double dataRate @unit("Gbps") = default(10Gbps);
-        double baseLatency @unit("ms") = default(2ms);
-    gates:
-        input linkIn;
-        output linkOut;
+        inout groundLink[];
 }
 
 network LEONetwork {
+    parameters:
+        @display("bgb=1000,500;bgi=earth,s"); // s = stretch to fit
+        int numPlanes = default(1);
+        int satsPerPlane = default(6);
+        // Total Sats = 6
+
     submodules:
-        sat1: Satellite{
-            satelliteId = 1;
-            altitude = 500km;
-            inclination = 53deg;
-            period = 5676s;
-            initialAngle = 0deg;
+        // 6 Satellites (1 Plane x 6 Sats)
+        sat[numPlanes * satsPerPlane]: Satellite {
+            parameters:
+                satelliteId = index + 1;
+                altitude = 550km;
+                inclination = 53deg;
+                // Single Plane: All RAAN 0
+                raan = 0deg;
+                // In-Plane Distribution (Anomaly): 0, 60, 120... deg
+                initialAngle = (index % 6) * (360deg / 6);
         }
-        sat2: Satellite{
-            satelliteId = 2;
-            altitude = 500km;
-            inclination = 53deg;
-            period = 5676s;
-            initialAngle = 120deg;
+
+        // Turkey Ground Station Network
+        istanbul: GroundStation {
+            locationName = "Istanbul";
+            latitude = 41.0082deg;
+            longitude = 28.9784deg;
         }
-        sat3: Satellite{
-            satelliteId = 3;
-            altitude = 500km;
-            inclination = 53deg;
-            period = 5676s;
-            initialAngle = 240deg;
+        ankara: GroundStation {
+            locationName = "Ankara";
+            latitude = 39.9334deg;
+            longitude = 32.8597deg;
         }
-        gs1: GroundStation{
-            x = 0km;
-            y = 0km;
-            z = 6371km;
-            maxRange = 2000km;
+        hakkari: GroundStation {
+            locationName = "Hakkari";
+            latitude = 37.5744deg;
+            longitude = 43.7408deg;
         }
-        
-        sgl_gs_to_sat1: SatelliteToGroundLink {
-            distance = 500km;
-            dataRate = 10Gbps;
-            baseLatency = 2ms;
-        }
-        sgl_gs_to_sat2: SatelliteToGroundLink {
-            distance = 500km;
-            dataRate = 10Gbps;
-            baseLatency = 2ms;
-        }
-        sgl_gs_to_sat3: SatelliteToGroundLink {
-            distance = 500km;
-            dataRate = 10Gbps;
-            baseLatency = 2ms;
-        }
-        
-        // Satellite -> Ground Station links
-        sgl_sat1_to_gs: SatelliteToGroundLink {
-            distance = 500km;
-            dataRate = 10Gbps;
-            baseLatency = 2ms;
-        }
-        sgl_sat2_to_gs: SatelliteToGroundLink {
-            distance = 500km;
-            dataRate = 10Gbps;
-            baseLatency = 2ms;
-        }
-        sgl_sat3_to_gs: SatelliteToGroundLink {
-            distance = 500km;
-            dataRate = 10Gbps;
-            baseLatency = 2ms;
-        }
+
     connections allowunconnected:
-        // sat1 <-> sat2
-        sat1.radioOut$o[0] --> sat2.radioIn$i[0];
-        sat2.radioOut$o[0] --> sat1.radioIn$i[0];
-        // sat1 <-> sat3
-        sat1.radioOut$o[1] --> sat3.radioIn$i[0];
-        sat3.radioOut$o[0] --> sat1.radioIn$i[1];
-        // sat2 <-> sat3
-        sat2.radioOut$o[1] --> sat3.radioIn$i[1];
-        sat3.radioOut$o[1] --> sat2.radioIn$i[1];
+        // --- Inter-Satellite Links (ISL) Ring Topology ---
+        for i=0..5 {
+            // 1. Intra-Plane Link (Connect to Next Sat in Ring)
+            sat[i].radioOut$o++ --> InterSatelliteLink --> sat[ int((i+1)%6) ].radioIn$i++;
+            sat[ int((i+1)%6) ].radioOut$o++ --> InterSatelliteLink --> sat[i].radioIn$i++;
+        }
 
+        // --- Ground Station Uplinks/Downlinks ---
+        for i=0..5 {
+            // Istanbul Links
+            istanbul.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
+            sat[i].radioOut$o++ --> SatelliteToGroundLink --> istanbul.groundLink$i++;
+            
+            // Ankara Links
+            ankara.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
+            sat[i].radioOut$o++ --> SatelliteToGroundLink --> ankara.groundLink$i++;
 
-        gs1.groundLink$o[0] --> sgl_gs_to_sat1.linkIn;
-        sgl_gs_to_sat1.linkOut --> sat1.radioIn$i[2];
-        
-        gs1.groundLink$o[1] --> sgl_gs_to_sat2.linkIn;
-        sgl_gs_to_sat2.linkOut --> sat2.radioIn$i[2];
-        
-        gs1.groundLink$o[2] --> sgl_gs_to_sat3.linkIn;
-        sgl_gs_to_sat3.linkOut --> sat3.radioIn$i[2];
-        
-        // Satellite -> Ground Station bağlantıları
-        sat1.radioOut$o[2] --> sgl_sat1_to_gs.linkIn;
-        sgl_sat1_to_gs.linkOut --> gs1.groundLink$i[0];
-        
-        sat2.radioOut$o[2] --> sgl_sat2_to_gs.linkIn;
-        sgl_sat2_to_gs.linkOut --> gs1.groundLink$i[1];
-        
-        sat3.radioOut$o[2] --> sgl_sat3_to_gs.linkIn;
-        sgl_sat3_to_gs.linkOut --> gs1.groundLink$i[2];
-
+            // Hakkari Links
+            hakkari.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
+            sat[i].radioOut$o++ --> SatelliteToGroundLink --> hakkari.groundLink$i++;
+        }
 }

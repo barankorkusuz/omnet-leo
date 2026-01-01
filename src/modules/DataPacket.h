@@ -24,7 +24,7 @@ public:
     packetId = 0;
     hopCount = 0;
     creationTime = simTime();
-    setBitLength(1024 * 8); // Varsayılan boyut: 1KB
+    setBitLength(1024 * 8); // Default size: 1KB
   }
   DataPacket(const DataPacket &other) : cPacket(other) {
     sourceId = other.sourceId;

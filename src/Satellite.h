@@ -18,6 +18,7 @@ private:
   OrbitParams orbitParams;
   Position3D currentPosition;
   cMessage *updateTimer;
+  cMessage *trafficTimer;
 
   double maxISLRange;
 
