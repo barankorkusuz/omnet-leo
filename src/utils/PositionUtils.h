@@ -1,3 +1,6 @@
+#ifndef POSITIONUTILS_H
+#define POSITIONUTILS_H
+
 struct Position3D {
   double x, y, z;
 };
@@ -11,3 +14,5 @@ struct OrbitParams {
 
 Position3D updateLEOOrbit(const OrbitParams &params, double time);
 double calculateDistance(const Position3D &p1, const Position3D &p2);
+
+#endif

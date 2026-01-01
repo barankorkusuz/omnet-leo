@@ -1,6 +1,7 @@
 #ifndef __MY_LEO_SATELLITE_H
 #define __MY_LEO_SATELLITE_H
 
+#include "modules/RoutingMessage.h"
 #include "omnetpp/cmessage.h"
 #include "utils/PositionUtils.h"
 #include <omnetpp.h>
@@ -9,6 +10,7 @@
 using namespace omnetpp;
 
 class Satellite : public cSimpleModule {
+
 private:
   int satelliteId;
   OrbitParams orbitParams;
@@ -24,11 +26,23 @@ private:
   };
   std::vector<NeighborInfo> neighbors;
 
+  struct RoutingEntry {
+    int destinationId;
+    int nextHopId;
+    double cost;
+  };
+  std::vector<RoutingEntry> routingTable;
+  void updateRoutingTable();
+  void routeMessage(cMessage *msg, int destinationId);
+
   void findNeighborSatellites();
   void updateNeighborList();
   double calculateDistanceToSatellite(cModule *otherSatellite) const;
 
   void sendToNeighbor(cModule *targetsatellite, cMessage *msg);
+
+  void broadcastRoutingTable();
+  void processRoutingMessage(RoutingMessage *msg);
 
 protected:
   virtual void initialize() override;

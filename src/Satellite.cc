@@ -1,11 +1,14 @@
 #include "Satellite.h"
+#include "modules/DataPacket.h"
+#include "modules/RoutingMessage.h"
+#include "omnetpp/checkandcast.h"
 #include "omnetpp/cmessage.h"
 #include "omnetpp/cmodule.h"
 #include <cstring>
 
 void Satellite::initialize() {
 
-  satelliteId = par("satelliteId");
+  satelliteId = par("satelliteId").intValue();
 
   orbitParams.altitude = par("altitude");
   orbitParams.inclination = par("inclination");
@@ -49,7 +52,32 @@ void Satellite::handleMessage(cMessage *msg) {
        << endl;
 
     scheduleAt(simTime() + 1.0, updateTimer);
-  } else {
+  } else if (dynamic_cast<RoutingMessage *>(msg) != nullptr) {
+    processRoutingMessage(check_and_cast<RoutingMessage *>(msg));
+  } else if (dynamic_cast<DataPacket *>(msg) != nullptr) {
+    DataPacket *packet = check_and_cast<DataPacket *>(msg);
+    // I am the receiver take the message
+    if (packet->destinationId == satelliteId) {
+      EV << "Satellite " << satelliteId << " received packet #"
+         << packet->packetId << " from " << packet->sourceId
+         << " (hops: " << packet->hopCount << ")" << endl;
+      delete packet;
+    }
+    // forward
+    else {
+      packet->hopCount++;
+      routeMessage(packet, packet->destinationId);
+    }
+  }
+
+  else {
+    // Gelen mesajları işle
+    EV << "Satellite " << satelliteId << " received message: " << msg->getName()
+       << endl;
+    if (strcmp(msg->getName(), "TestFromGS") != 0) {
+      cMessage *reply = new cMessage("ReplyFromSat");
+      send(reply, "radioOut$o", 2);
+    }
     delete msg;
   }
 }
@@ -63,8 +91,8 @@ void Satellite::finish() {
 void Satellite::findNeighborSatellites() {
   // print neighbors.
   for (const auto &neighbor : neighbors) {
-    EV << "Neighbours of " << satelliteId << neighbor.module->par("satelliteId")
-       << endl;
+    EV << "Neighbours of " << satelliteId
+       << neighbor.module->par("satelliteId").intValue() << endl;
   }
 }
 
@@ -110,12 +138,14 @@ void Satellite::updateNeighborList() {
       neighbors.push_back(neighbor);
 
       EV << "Satellite " << satelliteId << " connected to "
-         << submod->par("satelliteId") << " at distance: " << distance << " km"
-         << endl;
+         << submod->par("satelliteId").intValue()
+         << " at distance: " << distance << " km" << endl;
 
       gateIndex++;
     }
   }
+  updateRoutingTable();
+  broadcastRoutingTable();
 }
 
 void Satellite::sendToNeighbor(cModule *targetSatellite, cMessage *msg) {
@@ -129,8 +159,101 @@ void Satellite::sendToNeighbor(cModule *targetSatellite, cMessage *msg) {
     }
   }
   EV << "ERROR: Target satellite not in neighbor list! Sender: " << satelliteId
-     << " Target: " << targetSatellite->par("satelliteId") << endl;
+     << " Target: " << targetSatellite->par("satelliteId").intValue() << endl;
   delete msg;
 }
 
+void Satellite::updateRoutingTable() {
+  routingTable.clear();
+
+  for (const auto &neighbor : neighbors) {
+    RoutingEntry entry;
+    entry.destinationId = neighbor.module->par("satelliteId").intValue();
+    entry.nextHopId = entry.destinationId;
+    entry.cost = neighbor.distance;
+
+    routingTable.push_back(entry);
+  }
+  EV << "Satellite " << satelliteId << " routing table updated with "
+     << routingTable.size() << " entries" << endl;
+}
+void Satellite::routeMessage(cMessage *msg, int destinationId) {
+  for (const auto &entry : routingTable) {
+    if (entry.destinationId == destinationId) {
+      for (const auto &neighbor : neighbors) {
+        if (neighbor.module->par("satelliteId").intValue() == entry.nextHopId) {
+          sendToNeighbor(neighbor.module, msg);
+          EV << "Satellite " << satelliteId << " routing message to "
+             << destinationId << " via " << entry.nextHopId << endl;
+          return;
+        }
+      }
+    }
+  }
+}
+
+void Satellite::broadcastRoutingTable() {
+  RoutingMessage *rmsg = new RoutingMessage("RoutingUpdate");
+  rmsg->sourceId = satelliteId;
+
+  for (const auto &entry : routingTable) {
+    rmsg->destIds.push_back(entry.destinationId);
+    rmsg->costs.push_back(entry.cost);
+  }
+  rmsg->destIds.push_back(satelliteId);
+  rmsg->costs.push_back(0.0);
+
+  for (const auto &neighbor : neighbors) {
+
+    RoutingMessage *msgCopy = rmsg->dup();
+    sendToNeighbor(neighbor.module, msgCopy);
+  }
+
+  delete rmsg;
+  EV << "Satellite " << satelliteId << " broadcasted routing table" << endl;
+}
+void Satellite::processRoutingMessage(RoutingMessage *msg) {
+  bool updated = false;
+
+  for (size_t i = 0; i < msg->destIds.size(); i++) {
+    int destId = msg->destIds[i];
+    double receivedCost = msg->costs[i];
+
+    double linkCost = 0.0;
+    for (const auto &neighbor : neighbors) {
+      if (neighbor.module->par("satelliteId").intValue() == msg->sourceId) {
+        linkCost = neighbor.distance;
+        break;
+      }
+    }
+
+    double totalCost = receivedCost + linkCost;
+
+    bool found = false;
+    for (auto &entry : routingTable) {
+      if (entry.destinationId == destId) {
+        if (totalCost < entry.cost) {
+          entry.nextHopId = msg->sourceId;
+          entry.cost = totalCost;
+          updated = true;
+        }
+        found = true;
+        break;
+      }
+    }
+    if (!found && destId != satelliteId) {
+      RoutingEntry entry;
+      entry.destinationId = destId;
+      entry.nextHopId = msg->sourceId;
+      entry.cost = totalCost;
+      routingTable.push_back(entry);
+      updated = true;
+    }
+  }
+  if (updated) {
+    EV << "Satellite " << satelliteId << " updated routing table from "
+       << msg->sourceId << endl;
+  }
+  delete msg;
+}
 Define_Module(Satellite);
