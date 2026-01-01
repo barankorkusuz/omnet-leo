@@ -17,7 +17,7 @@ Position3D updateLEOOrbit(const OrbitParams &params, double time) {
   double inclinationRad = params.inclination * M_PI / 180.0;
 
   double x_plane = radius * cos(angle);
-  double y_plane = radius * cos(angle);
+  double y_plane = radius * sin(angle);
   double z_plane = 0.0;
 
   pos.x = x_plane;

@@ -16,6 +16,10 @@ private:
   cModule *currentSatellite; // current connected satellite
   cMessage *handoverTimer;
 
+  cOutVector *endToEndDelay;
+  long packetsSent;
+  long packetsReceived;
+
   cModule *findNearestSatellite() const;
 
   void performHandover();

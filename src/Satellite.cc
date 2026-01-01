@@ -2,8 +2,11 @@
 #include "modules/DataPacket.h"
 #include "modules/RoutingMessage.h"
 #include "omnetpp/checkandcast.h"
+#include "omnetpp/chistogram.h"
 #include "omnetpp/cmessage.h"
 #include "omnetpp/cmodule.h"
+#include "omnetpp/coutvector.h"
+#include "omnetpp/csimulation.h"
 #include <cstring>
 
 void Satellite::initialize() {
@@ -32,6 +35,16 @@ void Satellite::initialize() {
 
   updateTimer = new cMessage("updatePosition");
   scheduleAt(simTime() + 1.0, updateTimer);
+
+  endToEndDelay = new cOutVector("endToEndDelay");
+  hopCountVector = new cOutVector("hopCount");
+  hopCountHist = new cHistogram("hopCountHist");
+
+  packetsReceived = 0;
+  packetsForwarded = 0;
+  packetsDropped = 0;
+  totalBitsReceived = 0;
+  EV << "Satellite " << satelliteId << " statistics initialized" << endl;
 }
 
 void Satellite::handleMessage(cMessage *msg) {
@@ -41,8 +54,8 @@ void Satellite::handleMessage(cMessage *msg) {
 
     currentPosition = updateLEOOrbit(orbitParams, simTimeSeconds);
 
-    getDisplayString().setTagArg("p", 0, currentPosition.x);
-    getDisplayString().setTagArg("p", 1, currentPosition.y);
+    getDisplayString().setTagArg("p", 0, (long)currentPosition.x);
+    getDisplayString().setTagArg("p", 1, (long)currentPosition.y);
 
     updateNeighborList();
     findNeighborSatellites();
@@ -56,8 +69,15 @@ void Satellite::handleMessage(cMessage *msg) {
     processRoutingMessage(check_and_cast<RoutingMessage *>(msg));
   } else if (dynamic_cast<DataPacket *>(msg) != nullptr) {
     DataPacket *packet = check_and_cast<DataPacket *>(msg);
+
+    hopCountVector->record(packet->hopCount);
+    hopCountHist->collect(packet->hopCount);
     // I am the receiver take the message
     if (packet->destinationId == satelliteId) {
+      packetsReceived++;
+      totalBitsReceived += packet->getBitLength();
+      simtime_t delay = simTime() - packet->creationTime;
+      endToEndDelay->record(delay.dbl());
       EV << "Satellite " << satelliteId << " received packet #"
          << packet->packetId << " from " << packet->sourceId
          << " (hops: " << packet->hopCount << ")" << endl;
@@ -65,12 +85,30 @@ void Satellite::handleMessage(cMessage *msg) {
     }
     // forward
     else {
+      packetsForwarded++;
       packet->hopCount++;
-      routeMessage(packet, packet->destinationId);
-    }
-  }
 
-  else {
+      bool routeFound = false;
+      for (const auto &entry : routingTable) {
+        if (entry.destinationId == packet->destinationId) {
+          routeFound = true;
+          break;
+        }
+      }
+      if (routeFound) {
+        routeMessage(packet, packet->destinationId);
+        EV << "Satellite " << satelliteId << " forwarding packet #"
+           << packet->packetId << " to " << packet->destinationId
+           << " (hops: " << packet->hopCount << ")" << endl;
+      } else {
+        packetsDropped++;
+        EV << "ERROR: Satellite " << satelliteId << " dropped packet #"
+           << packet->packetId << " (no route to " << packet->destinationId
+           << ")" << endl;
+        delete packet;
+      }
+    }
+  } else {
     // Gelen mesajları işle
     EV << "Satellite " << satelliteId << " received message: " << msg->getName()
        << endl;
@@ -86,6 +124,39 @@ void Satellite::finish() {
   if (updateTimer) {
     cancelAndDelete(updateTimer);
   }
+  // istatistics
+  EV << "=== Satellite " << satelliteId << " Statistics ===" << endl;
+  EV << "Packets Received: " << packetsReceived << endl;
+  EV << "Packets Forwarded: " << packetsForwarded << endl;
+  EV << "Packets Dropped: " << packetsDropped << endl;
+  EV << "Total Packets Processed: "
+     << (packetsReceived + packetsForwarded + packetsDropped) << endl;
+
+  // --- New Statistics: Throughput & PDR ---
+  double simDuration = simTime().dbl();
+  double throughputBps = (simDuration > 0) ? (double)totalBitsReceived / simDuration : 0.0;
+  
+  double totalAttempts = packetsReceived + packetsDropped; // Simplified PDR base
+  double pdr = (totalAttempts > 0) ? (double)packetsReceived / totalAttempts : 0.0;
+
+  EV << "Throughput: " << throughputBps << " bps" << endl;
+  EV << "PDR: " << pdr * 100.0 << " %" << endl;
+
+  // Record scalars for OMNeT++ Analysis (.anf)
+  recordScalar("Throughput_bps", throughputBps);
+  recordScalar("PacketDeliveryRatio", pdr);
+  recordScalar("PacketsReceived", packetsReceived);
+  recordScalar("PacketsDropped", packetsDropped);
+
+  if (hopCountHist->getCount() > 0) {
+    EV << "Hop Count - Mean: " << hopCountHist->getMean()
+       << ", Min: " << hopCountHist->getMin()
+       << ", Max: " << hopCountHist->getMax() << endl;
+  }
+
+  delete endToEndDelay;
+  delete hopCountHist;
+  delete hopCountVector;
 }
 
 void Satellite::findNeighborSatellites() {

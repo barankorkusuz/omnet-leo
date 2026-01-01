@@ -17,6 +17,10 @@ void GroundStation::initialize() {
   maxRange = par("maxRange");
   currentSatellite = nullptr;
 
+  endToEndDelay = new cOutVector("endToEndDelay");
+  packetsSent = 0;
+  packetsReceived = 0;
+
   EV << "GroundStation initialized at position: (" << position.x << ", "
      << position.y << ", " << position.z << ") km" << endl;
 
@@ -42,7 +46,6 @@ void GroundStation::initialize() {
 }
 
 void GroundStation::handleMessage(cMessage *msg) {
-  // TODO: implement
 
   if (msg == handoverTimer) { // handover timer
     performHandover();
@@ -50,8 +53,15 @@ void GroundStation::handleMessage(cMessage *msg) {
   } else if (dynamic_cast<DataPacket *>(msg) != nullptr) {
     // DataPacket alındı
     DataPacket *packet = check_and_cast<DataPacket *>(msg);
+    packetsReceived++;
+
+    // End-to-end delay
+    simtime_t delay = simTime() - packet->creationTime;
+    endToEndDelay->record(delay.dbl());
+
     EV << "GroundStation received DataPacket #" << packet->packetId << " from "
-       << packet->sourceId << " (hops: " << packet->hopCount << ")" << endl;
+       << packet->sourceId << " (hops: " << packet->hopCount
+       << ", delay: " << delay << "s)" << endl;
     delete packet;
   } else { // normal messages
     EV << "GroundStation received message: " << msg->getName() << endl;
@@ -63,6 +73,14 @@ void GroundStation::finish() {
   if (handoverTimer) {
     cancelAndDelete(handoverTimer);
   }
+
+  // istatistics
+  EV << "=== GroundStation Statistics ===" << endl;
+  EV << "Packets Sent: " << packetsSent << endl;
+  EV << "Packets Received: " << packetsReceived << endl;
+  EV << "Total Packets: " << (packetsSent + packetsReceived) << endl;
+
+  delete endToEndDelay;
 
   EV << "GroundStation module finish" << endl;
 }
@@ -126,6 +144,10 @@ void GroundStation::sendToCurrentSatellite(cMessage *msg) {
     delete msg;
     return;
   }
+  if (dynamic_cast<DataPacket *>(msg) != nullptr) {
+    packetsSent++;
+  }
+
   int gate = getGateIndexForSatellite(currentSatellite);
   send(msg, "groundLink$o", gate);
 }
