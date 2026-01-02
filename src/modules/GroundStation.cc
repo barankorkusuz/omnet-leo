@@ -15,6 +15,8 @@ void GroundStation::initialize() {
   geo.longitude = par("longitude");
   geo.altitude = par("altitude");
 
+  myAddress = par("address");
+
   position = geoToECEF(geo);
 
   // Set initial 2D Map position
@@ -28,40 +30,73 @@ void GroundStation::initialize() {
   endToEndDelay = new cOutVector("endToEndDelay");
   packetsSent = 0;
   packetsReceived = 0;
+  packetsDropped = 0;
+  totalBitsReceived = 0;
+  firstPacketTime = 0;
+  lastPacketTime = 0;
 
-  EV << "GroundStation initialized at position: (" << position.x << ", "
+  // Queue Init - Larger Buffer for GS too
+  txQueue = new cQueue("txQueue");
+  txFinishTimer = new cMessage("txFinishTimer");
+  maxQueueSize = 1000; 
+  
+  // DEBUG: Check actual Packet Size
+  int pSize = par("packetSize").intValue();
+  EV << "WARNING: GroundStation " << myAddress << " Packet Size is: " << pSize << " Bytes (" << (pSize*8.0)/1000000.0 << " Mb)" << endl;
+
+  EV << "GroundStation " << myAddress << " initialized at position: (" << position.x << ", "
      << position.y << ", " << position.z << ") km" << endl;
 
   handoverTimer = new cMessage("handoverTimer");
-  scheduleAt(simTime() + 5.0, handoverTimer);
+  scheduleAt(simTime() + 1.0, handoverTimer);
+
+  trafficTimer = new cMessage("trafficTimer");
+  scheduleAt(simTime() + par("sendInterval"), trafficTimer);
 
   // perform to find first satellite to connect
   performHandover();
-
-  if (currentSatellite) {
-    DataPacket *packet = new DataPacket("DataPacket");
-    packet->sourceId = 0;      // Ground Station ID
-    packet->destinationId = 3; // sat3
-    packet->packetId = 1;
-    packet->hopCount = 0;
-    packet->payload = "Hello from Ground Station";
-
-    sendToCurrentSatellite(packet);
-    EV << "GroundStation sent DataPacket to Satellite "
-       << currentSatellite->par("satelliteId").intValue()
-       << " (destination: " << packet->destinationId << ")" << endl;
-  }
 }
 
 void GroundStation::handleMessage(cMessage *msg) {
-
-  if (msg == handoverTimer) { // handover timer
+  if (msg == txFinishTimer) {
+      processTxQueue();
+  } else if (msg == handoverTimer) { // handover timer
     performHandover();
-    scheduleAt(simTime() + 5.0, handoverTimer);
+    scheduleAt(simTime() + 1.0, handoverTimer); // Check handover every 1s
+  } else if (msg == trafficTimer) {
+    // Generate Packet
+    char pktName[32];
+    snprintf(pktName, sizeof(pktName), "GS-%d-%ld", myAddress, packetsSent);
+    DataPacket *packet = new DataPacket(pktName);
+    packet->setBitLength(par("packetSize").intValue() * 8); // Bytes to Bits
+    packet->sourceId = myAddress;
+    
+    // Target Logic
+    if (myAddress == 99) {
+        // I am Istanbul -> Send to random hometown (101-110)
+        packet->destinationId = 101 + intuniform(0, 9);
+    } else {
+        // I am a Hometown -> Send to Istanbul (99)
+        packet->destinationId = 99;
+    }
+    
+    packet->packetId = packetsSent;
+    sendToCurrentSatellite(packet);
+    
+    // Reschedule
+    scheduleAt(simTime() + par("sendInterval"), trafficTimer);
+
   } else if (dynamic_cast<DataPacket *>(msg) != nullptr) {
     // DataPacket received
     DataPacket *packet = check_and_cast<DataPacket *>(msg);
     packetsReceived++;
+    totalBitsReceived += packet->getBitLength();
+    
+    // Time tracking for Throughput
+    if (packetsReceived == 1) {
+        firstPacketTime = simTime();
+    }
+    lastPacketTime = simTime();
 
     // End-to-end delay
     simtime_t delay = simTime() - packet->creationTime;
@@ -77,16 +112,71 @@ void GroundStation::handleMessage(cMessage *msg) {
   }
 }
 
+// --- Queue Logic ---
+void GroundStation::sendOrQueue(cMessage *msg, const char *gateName, int gateIndex) {
+    if (txQueue->getLength() >= maxQueueSize) {
+        EV << "GS Tx Queue Full! Dropping packet " << msg->getName() << endl;
+        packetsDropped++;
+        delete msg;
+        return;
+    }
+    msg->setContextPointer((void*)(intptr_t)gateIndex);
+    txQueue->insert(msg);
+    processTxQueue();
+}
+
+void GroundStation::processTxQueue() {
+    if (txQueue->isEmpty()) return;
+
+    cMessage *msg = (cMessage*)txQueue->front();
+    int gateIndex = (int)(intptr_t)msg->getContextPointer();
+    cGate *outGate = gate("groundLink$o", gateIndex);
+    cChannel *chan = outGate->getTransmissionChannel();
+
+    if (chan && chan->isBusy()) {
+        simtime_t finishTime = chan->getTransmissionFinishTime();
+        if (!txFinishTimer->isScheduled()) {
+            scheduleAt(finishTime, txFinishTimer);
+        }
+    } else {
+        txQueue->pop();
+        send(msg, "groundLink$o", gateIndex);
+        // Dont reschedule immediately, wait for next call or timer
+    }
+}
+
 void GroundStation::finish() {
   if (handoverTimer) {
     cancelAndDelete(handoverTimer);
   }
+  if (trafficTimer) {
+    cancelAndDelete(trafficTimer);
+  }
+  if (txFinishTimer) {
+    cancelAndDelete(txFinishTimer);
+  }
+  delete txQueue;
 
   // statistics
-  EV << "=== GroundStation Statistics ===" << endl;
+  EV << "=== GroundStation " << myAddress << " Statistics ===" << endl;
   EV << "Packets Sent: " << packetsSent << endl;
   EV << "Packets Received: " << packetsReceived << endl;
-  EV << "Total Packets: " << (packetsSent + packetsReceived) << endl;
+  EV << "Packets Dropped: " << packetsDropped << endl;
+
+  // --- End-to-End Metrics ---
+  double simDuration = simTime().dbl();
+  double activeDuration = (lastPacketTime - firstPacketTime).dbl();
+  if (activeDuration <= 0.001) activeDuration = simDuration;
+
+  double throughputBps = (activeDuration > 0) ? (double)totalBitsReceived / activeDuration : 0.0;
+  
+  // PDR for this Node (Rx Success) -> Not fully accurate for global PDR, but good for local
+  // For global view, better use Drops.
+  
+  recordScalar("Throughput_bps", throughputBps);
+  recordScalar("PacketsReceived", packetsReceived);
+  recordScalar("PacketsSent", packetsSent);
+  recordScalar("PacketsDropped", packetsDropped);
 
   delete endToEndDelay;
 
@@ -144,22 +234,24 @@ void GroundStation::performHandover() {
       EV << "GroundStation connected to Satellite "
          << currentSatellite->par("satelliteId").intValue() << endl;
     } else {
-      EV << "GroundStation: No satellite in range!" << endl;
+      // No sat in range
     }
   }
 }
 void GroundStation::sendToCurrentSatellite(cMessage *msg) {
   if (!currentSatellite) {
-    EV << "ERROR: No satellite connected!" << endl;
+    EV << "WARN: No satellite connected to GS! Packet dropped." << endl;
+    packetsDropped++;
     delete msg;
     return;
   }
+  
   if (dynamic_cast<DataPacket *>(msg) != nullptr) {
     packetsSent++;
   }
 
   int gate = getGateIndexForSatellite(currentSatellite);
-  send(msg, "groundLink$o", gate);
+  sendOrQueue(msg, "groundLink$o", gate);
 }
 
 int GroundStation::getGateIndexForSatellite(cModule *satellite) const {
