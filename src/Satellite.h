@@ -5,17 +5,34 @@
 #include "omnetpp/chistogram.h"
 #include "omnetpp/cmessage.h"
 #include "omnetpp/coutvector.h"
+#include "omnetpp/cpacketqueue.h"
 #include "utils/PositionUtils.h"
 #include <omnetpp.h>
 #include <vector>
 
 using namespace omnetpp;
 
+#include "omnetpp/cqueue.h"
+
+// ... existing includes ...
+
 class Satellite : public cSimpleModule {
 
 private:
   int satelliteId;
+  // ... existing params ...
+
+  // Queue Management
+  cQueue *txQueue;
+  cMessage *txFinishTimer;
+  int maxQueueSize; // Limit queue size to simulate drop
+  
+  // Helper to handle sending
+  void sendOrQueue(cMessage *msg, const char *gateName, int gateIndex);
+  void processTxQueue();
+
   OrbitParams orbitParams;
+  // ... existing members ...
   Position3D currentPosition;
   cMessage *updateTimer;
   cMessage *trafficTimer;
@@ -45,6 +62,9 @@ private:
   long packetsForwarded;
   long packetsDropped;
   long totalBitsReceived;
+
+  simtime_t firstPacketTime;
+  simtime_t lastPacketTime;
 
   void findNeighborSatellites();
   void updateNeighborList();
