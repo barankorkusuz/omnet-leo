@@ -110,6 +110,7 @@ Position3D calculateSatellitePositionECEF(const OrbitParams &params, double time
     Position3D pos;
     pos.x = x_ecef;
     pos.y = y_ecef;
+    pos.z = z_ecef;
     return pos;
 }
 

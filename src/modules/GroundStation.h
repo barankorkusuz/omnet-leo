@@ -15,9 +15,14 @@ private:
   int myAddress;
   Position3D position;
   double maxRange;
-  cModule *currentSatellite; // current connected satellite
+  cModule *currentSatellite;     // current connected satellite
+  int currentSatGateIndex;       // gate index on satellite side for this GS
   cMessage *handoverTimer;
   cMessage *trafficTimer;
+
+  // Dynamic connection management
+  void connectToSatellite(cModule *satellite);
+  void disconnectFromSatellite();
 
   // Queue Management
   cQueue *txQueue;
@@ -39,7 +44,6 @@ private:
 
   void performHandover();
   void sendToCurrentSatellite(cMessage *msg);
-  int getGateIndexForSatellite(cModule *satellite) const;
 
 protected:
   virtual void initialize() override;

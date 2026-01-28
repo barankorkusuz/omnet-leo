@@ -11,7 +11,7 @@ channel InterSatelliteLink extends ned.DatarateChannel {
     parameters:
         double distance @unit("km") = default(1000km);
         double baseLatency @unit("ms") = default(5ms);
-        delay = (distance / 299792.458km) * 1s + baseLatency;
+        delay @mutable = (distance / 299792.458km) * 1s + baseLatency;  // Updated dynamically
         datarate = default(10Gbps);
 }
 
@@ -58,19 +58,21 @@ simple GroundStation
 network LEONetwork {
     parameters:
         @display("bgb=1000,500;bgi=earth,s");
-        int numPlanes = default(1);
+        int numPlanes = default(3);
         int satsPerPlane = default(6);
-        // Total Sats = 6
+        // Total Sats = 18 (for Turkey 24/7 coverage)
 
     submodules:
-        // 6 Satellites
+        // 18 Satellites in 3 orbital planes (Walker 50:18/3/1)
         sat[numPlanes * satsPerPlane]: Satellite {
             parameters:
                 satelliteId = index + 1;
                 altitude = 550km;
-                inclination = 53deg;
-                raan = 0deg;
-                initialAngle = (index % 6) * (360deg / 6);
+                inclination = 50deg;  // Optimized for Turkey (36-42°N)
+                // RAAN: 0°, 60°, 120° for each plane
+                raan = (index / 6) * 60deg;
+                // Initial angle: 60° spacing within plane + 20° phase offset between planes
+                initialAngle = ((index % 6) * 60deg) + ((index / 6) * 20deg);
         }
 
         // --- Istanbul (Hub) ---
@@ -145,57 +147,36 @@ network LEONetwork {
         }
 
     connections allowunconnected:
-        // --- ISL Ring ---
+        // --- Intra-Plane ISL (Ring within each orbital plane) ---
+        // Plane 0: sat[0-5]
         for i=0..5 {
-            sat[i].radioOut$o++ --> InterSatelliteLink --> sat[ int((i+1)%6) ].radioIn$i++;
-            sat[ int((i+1)%6) ].radioOut$o++ --> InterSatelliteLink --> sat[i].radioIn$i++;
+            sat[i].radioOut$o++ --> InterSatelliteLink --> sat[(i+1)%6].radioIn$i++;
+            sat[(i+1)%6].radioOut$o++ --> InterSatelliteLink --> sat[i].radioIn$i++;
+        }
+        // Plane 1: sat[6-11]
+        for i=0..5 {
+            sat[6+i].radioOut$o++ --> InterSatelliteLink --> sat[6+((i+1)%6)].radioIn$i++;
+            sat[6+((i+1)%6)].radioOut$o++ --> InterSatelliteLink --> sat[6+i].radioIn$i++;
+        }
+        // Plane 2: sat[12-17]
+        for i=0..5 {
+            sat[12+i].radioOut$o++ --> InterSatelliteLink --> sat[12+((i+1)%6)].radioIn$i++;
+            sat[12+((i+1)%6)].radioOut$o++ --> InterSatelliteLink --> sat[12+i].radioIn$i++;
         }
 
-        // --- Ground Station Connections ---
-        // Connecting all 11 stations (Istanbul + 10 Cities) to all satellites
+        // --- Inter-Plane ISL (Cross-links between adjacent planes) ---
         for i=0..5 {
-            // Istanbul
-            istanbul.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> istanbul.groundLink$i++;
-
-            // 1. Sivas
-            sivas.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> sivas.groundLink$i++;
-
-            // 2. Kastamonu
-            kastamonu.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> kastamonu.groundLink$i++;
-
-            // 3. Ordu
-            ordu.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> ordu.groundLink$i++;
-            
-            // 4. Giresun
-            giresun.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> giresun.groundLink$i++;
-
-            // 5. Tokat
-            tokat.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> tokat.groundLink$i++;
-
-            // 6. Erzurum
-            erzurum.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> erzurum.groundLink$i++;
-
-            // 7. Malatya
-            malatya.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> malatya.groundLink$i++;
-
-            // 8. Samsun
-            samsun.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> samsun.groundLink$i++;
-
-            // 9. Trabzon
-            trabzon.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> trabzon.groundLink$i++;
-
-            // 10. Sinop
-            sinop.groundLink$o++ --> SatelliteToGroundLink --> sat[i].radioIn$i++;
-            sat[i].radioOut$o++ --> SatelliteToGroundLink --> sinop.groundLink$i++;
+            // Plane 0 <-> Plane 1
+            sat[i].radioOut$o++ --> InterSatelliteLink --> sat[6+i].radioIn$i++;
+            sat[6+i].radioOut$o++ --> InterSatelliteLink --> sat[i].radioIn$i++;
+            // Plane 1 <-> Plane 2
+            sat[6+i].radioOut$o++ --> InterSatelliteLink --> sat[12+i].radioIn$i++;
+            sat[12+i].radioOut$o++ --> InterSatelliteLink --> sat[6+i].radioIn$i++;
+            // Plane 2 <-> Plane 0 (closing the mesh)
+            sat[12+i].radioOut$o++ --> InterSatelliteLink --> sat[i].radioIn$i++;
+            sat[i].radioOut$o++ --> InterSatelliteLink --> sat[12+i].radioIn$i++;
         }
+
+        // Ground Station connections are DYNAMIC
+        // Created at runtime by GroundStation::performHandover()
 }

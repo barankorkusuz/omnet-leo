@@ -1,6 +1,7 @@
 #include "GroundStation.h"
 #include "DataPacket.h"
 #include "omnetpp/checkandcast.h"
+#include "omnetpp/cdataratechannel.h"
 #include "omnetpp/cmessage.h"
 #include "omnetpp/cmodule.h"
 #include "omnetpp/csimulation.h"
@@ -26,6 +27,7 @@ void GroundStation::initialize() {
 
   maxRange = par("maxRange");
   currentSatellite = nullptr;
+  currentSatGateIndex = -1;
 
   endToEndDelay = new cOutVector("endToEndDelay");
   packetsSent = 0;
@@ -127,10 +129,15 @@ void GroundStation::sendOrQueue(cMessage *msg, const char *gateName, int gateInd
 
 void GroundStation::processTxQueue() {
     if (txQueue->isEmpty()) return;
+    if (gateSize("groundLink") == 0) return;
+
+    cGate *outGate = gate("groundLink$o", 0);
+    if (!outGate->isConnected()) {
+        // No connection, wait for handover
+        return;
+    }
 
     cMessage *msg = (cMessage*)txQueue->front();
-    int gateIndex = (int)(intptr_t)msg->getContextPointer();
-    cGate *outGate = gate("groundLink$o", gateIndex);
     cChannel *chan = outGate->getTransmissionChannel();
 
     if (chan && chan->isBusy()) {
@@ -140,8 +147,7 @@ void GroundStation::processTxQueue() {
         }
     } else {
         txQueue->pop();
-        send(msg, "groundLink$o", gateIndex);
-        // Dont reschedule immediately, wait for next call or timer
+        send(msg, "groundLink$o", 0);
     }
 }
 
@@ -224,43 +230,130 @@ void GroundStation::performHandover() {
   cModule *nearestSat = findNearestSatellite();
 
   if (nearestSat != currentSatellite) {
+    // Disconnect from old satellite
     if (currentSatellite) {
-      EV << "GroundStation handover from Satellite "
+      EV << "GroundStation " << myAddress << " handover FROM Satellite "
          << currentSatellite->par("satelliteId").intValue() << endl;
+      disconnectFromSatellite();
     }
+
     currentSatellite = nearestSat;
 
+    // Connect to new satellite
     if (currentSatellite) {
-      EV << "GroundStation connected to Satellite "
+      connectToSatellite(currentSatellite);
+      EV << "GroundStation " << myAddress << " handover TO Satellite "
          << currentSatellite->par("satelliteId").intValue() << endl;
     } else {
-      // No sat in range
+      EV << "GroundStation " << myAddress << " has NO satellite in range!" << endl;
     }
   }
 }
+
+void GroundStation::connectToSatellite(cModule *satellite) {
+  // Ensure we have at least 1 gate
+  if (gateSize("groundLink") == 0) {
+    setGateSize("groundLink", 1);
+  }
+
+  // Get our gates
+  cGate *gsOutGate = gate("groundLink$o", 0);
+  cGate *gsInGate = gate("groundLink$i", 0);
+
+  // Expand satellite gate arrays
+  int satGateSize = satellite->gateSize("radioIn");
+  satellite->setGateSize("radioIn", satGateSize + 1);
+  satellite->setGateSize("radioOut", satGateSize + 1);
+  currentSatGateIndex = satGateSize;
+
+  cGate *satInGate = satellite->gate("radioIn$i", currentSatGateIndex);
+  cGate *satOutGate = satellite->gate("radioOut$o", currentSatGateIndex);
+
+  // Calculate real distance to satellite for accurate delay
+  OrbitParams satOrbit;
+  satOrbit.semiMajorAxis = EARTH_RADIUS + satellite->par("altitude").doubleValue();
+  satOrbit.inclination = satellite->par("inclination");
+  satOrbit.raan = satellite->par("raan");
+  satOrbit.argPerigee = satellite->par("argPerigee");
+  satOrbit.trueAnomaly = satellite->par("initialAngle");
+  satOrbit.eccentricity = satellite->par("eccentricity");
+
+  Position3D satPos = calculateSatellitePositionECEF(satOrbit, simTime().dbl());
+  double distance = calculateDistance(position, satPos);  // km
+
+  // Propagation delay = distance / speed_of_light + processing delay
+  // Speed of light = 299792.458 km/s
+  double propagationDelay = distance / 299792.458;  // seconds
+  double processingDelay = 0.001;  // 1ms processing
+  double totalDelay = propagationDelay + processingDelay;
+
+  EV << "GS " << myAddress << " -> Sat " << satellite->par("satelliteId").intValue()
+     << " distance: " << distance << " km, delay: " << (totalDelay * 1000) << " ms" << endl;
+
+  // Create channels (GS -> Satellite)
+  cDatarateChannel *channelToSat = cDatarateChannel::create("gsToSat");
+  channelToSat->setDatarate(4e9);  // 4 Gbps
+  channelToSat->setDelay(totalDelay);
+
+  // Create channels (Satellite -> GS)
+  cDatarateChannel *channelFromSat = cDatarateChannel::create("satToGs");
+  channelFromSat->setDatarate(4e9);
+  channelFromSat->setDelay(totalDelay);
+
+  // Connect: GS -> Satellite
+  gsOutGate->connectTo(satInGate, channelToSat);
+  channelToSat->callInitialize();
+
+  // Connect: Satellite -> GS
+  satOutGate->connectTo(gsInGate, channelFromSat);
+  channelFromSat->callInitialize();
+
+  EV << "Dynamic link created: GS " << myAddress << " <-> Satellite "
+     << satellite->par("satelliteId").intValue()
+     << " (gate index: " << currentSatGateIndex << ")" << endl;
+}
+
+void GroundStation::disconnectFromSatellite() {
+  if (gateSize("groundLink") == 0) return;
+
+  cGate *gsOutGate = gate("groundLink$o", 0);
+  cGate *gsInGate = gate("groundLink$i", 0);
+
+  // Disconnect outgoing
+  if (gsOutGate->isConnected()) {
+    gsOutGate->disconnect();
+  }
+
+  // Disconnect incoming (from satellite side)
+  if (gsInGate->isConnected()) {
+    cGate *remoteSrcGate = gsInGate->getPreviousGate();
+    if (remoteSrcGate) {
+      remoteSrcGate->disconnect();
+    }
+  }
+
+  currentSatGateIndex = -1;
+}
 void GroundStation::sendToCurrentSatellite(cMessage *msg) {
-  if (!currentSatellite) {
-    EV << "WARN: No satellite connected to GS! Packet dropped." << endl;
+  if (!currentSatellite || gateSize("groundLink") == 0) {
+    EV << "WARN: No satellite connected to GS " << myAddress << "! Packet dropped." << endl;
     packetsDropped++;
     delete msg;
     return;
   }
-  
+
+  cGate *outGate = gate("groundLink$o", 0);
+  if (!outGate->isConnected()) {
+    EV << "WARN: GS " << myAddress << " gate not connected! Packet dropped." << endl;
+    packetsDropped++;
+    delete msg;
+    return;
+  }
+
   if (dynamic_cast<DataPacket *>(msg) != nullptr) {
     packetsSent++;
   }
 
-  int gate = getGateIndexForSatellite(currentSatellite);
-  sendOrQueue(msg, "groundLink$o", gate);
-}
-
-int GroundStation::getGateIndexForSatellite(cModule *satellite) const {
-  int numGates = gateSize("groundLink$o");
-  for (int i = 0; i < numGates; i++) {
-      const cGate *outGate = gate("groundLink$o", i);
-      if (outGate->isConnected() && outGate->getPathEndGate()->getOwnerModule() == satellite) {
-          return i;
-      }
-  }
-  return -1; // Not found
+  // Always use gate 0 (single dynamic connection)
+  sendOrQueue(msg, "groundLink$o", 0);
 }
