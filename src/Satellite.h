@@ -58,10 +58,10 @@ private:
   cOutVector *endToEndDelay;
   cOutVector *hopCountVector;
   cHistogram *hopCountHist;
-  long packetsReceived;
-  long packetsForwarded;
-  long packetsDropped;
-  long totalBitsReceived;
+  long packetsReceived;      // Packets where this satellite was the destination (should be 0)
+  long packetsForwarded;     // Packets successfully routed to next hop
+  long packetsDropped;       // Packets dropped (no route or queue full)
+  long totalBitsForwarded;   // Total bits forwarded (for throughput calculation)
 
   simtime_t firstPacketTime;
   simtime_t lastPacketTime;

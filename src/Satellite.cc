@@ -38,9 +38,8 @@ void Satellite::initialize() {
   updateTimer = new cMessage("updatePosition");
   scheduleAt(simTime() + 1.0, updateTimer);
 
-  // Start traffic generation
-  trafficTimer = new cMessage("generateTraffic");
-  scheduleAt(simTime() + par("sendInterval"), trafficTimer);
+  // Traffic generation disabled - satellites are only routers
+  trafficTimer = nullptr;
 
   endToEndDelay = new cOutVector("endToEndDelay");
   hopCountVector = new cOutVector("hopCount");
@@ -49,11 +48,11 @@ void Satellite::initialize() {
   packetsReceived = 0;
   packetsForwarded = 0;
   packetsDropped = 0;
-  totalBitsReceived = 0;
+  totalBitsForwarded = 0;
   firstPacketTime = 0;
   lastPacketTime = 0;
 
-  EV << "Satellite " << satelliteId << " statistics initialized" << endl;
+  EV << "Satellite " << satelliteId << " initialized as ROUTER" << endl;
 }
 
 void Satellite::handleMessage(cMessage *msg) {
@@ -82,50 +81,6 @@ void Satellite::handleMessage(cMessage *msg) {
        << endl;
 
     scheduleAt(simTime() + 1.0, updateTimer);
-  } else if (msg == trafficTimer) {
-    // 1. Create a new DataPacket
-    char pktName[32];
-    snprintf(pktName, sizeof(pktName), "Data-%d-%ld", satelliteId,
-             packetsReceived + packetsForwarded + packetsDropped);
-    DataPacket *packet = new DataPacket(pktName);
-    packet->setBitLength(par("packetSize").intValue() * 8); // Bytes to Bits
-    packet->sourceId = satelliteId;
-
-    // Pick a random destination from 1 to 6
-    // Ideally, we should detect the network size dynamically, but for now
-    // specific to 6 sats:
-    int dest = 1 + intuniform(0, 5);
-
-    while (dest == satelliteId) { // Don't send to self
-      dest = 1 + intuniform(0, 5);
-    }
-    packet->destinationId = dest;
-    packet->packetId =
-        packetsForwarded + packetsReceived + 1000; // Unique ID simulation
-
-    // 2. Route it
-    bool routeFound = false;
-    for (const auto &entry : routingTable) {
-      if (entry.destinationId == packet->destinationId) {
-        routeFound = true;
-        break;
-      }
-    }
-
-    if (routeFound) {
-      routeMessage(packet, packet->destinationId);
-      EV << "Satellite " << satelliteId << " GENERATED packet #"
-         << packet->packetId << " to " << packet->destinationId << endl;
-    } else {
-      EV << "Satellite " << satelliteId
-         << " COULD NOT ROUTE generated packet to " << packet->destinationId
-         << " (no route)" << endl;
-      delete packet;
-    }
-
-    // 3. Reschedule
-    scheduleAt(simTime() + par("sendInterval"), trafficTimer);
-
   } else if (dynamic_cast<RoutingMessage *>(msg) != nullptr) {
     processRoutingMessage(check_and_cast<RoutingMessage *>(msg));
   } else if (dynamic_cast<DataPacket *>(msg) != nullptr) {
@@ -133,26 +88,16 @@ void Satellite::handleMessage(cMessage *msg) {
 
     hopCountVector->record(packet->hopCount);
     hopCountHist->collect(packet->hopCount);
-    // I am the receiver take the message
-    if (packet->destinationId == satelliteId) {
-      packetsReceived++;
-      totalBitsReceived += packet->getBitLength();
-      
-      if (packetsReceived == 1) {
-          firstPacketTime = simTime();
-      }
-      lastPacketTime = simTime();
 
-      simtime_t delay = simTime() - packet->creationTime;
-      endToEndDelay->record(delay.dbl());
-      EV << "Satellite " << satelliteId << " received packet #"
-         << packet->packetId << " from " << packet->sourceId
-         << " (hops: " << packet->hopCount << ")" << endl;
+    // Satellites should NOT be destinations - they are only routers
+    if (packet->destinationId == satelliteId) {
+      EV << "WARNING: Satellite " << satelliteId << " received packet meant for itself. "
+         << "This should not happen - satellites are routers only!" << endl;
+      packetsReceived++;  // Count but this should stay 0
       delete packet;
     }
-    // forward
+    // forward (satellites are routers - this is the main path)
     else {
-      packetsForwarded++;
       packet->hopCount++;
 
       bool routeFound = false;
@@ -163,6 +108,14 @@ void Satellite::handleMessage(cMessage *msg) {
         }
       }
       if (routeFound) {
+        packetsForwarded++;
+        totalBitsForwarded += packet->getBitLength();
+
+        if (packetsForwarded == 1) {
+            firstPacketTime = simTime();
+        }
+        lastPacketTime = simTime();
+
         routeMessage(packet, packet->destinationId);
         EV << "Satellite " << satelliteId << " forwarding packet #"
            << packet->packetId << " to " << packet->destinationId
@@ -190,12 +143,29 @@ void Satellite::handleMessage(cMessage *msg) {
 // --- Queue Logic ---
 void Satellite::sendOrQueue(cMessage *msg, const char *gateName,
                             int gateIndex) {
+  // Check if gate is valid and connected before queueing
+  if (gateIndex < 0 || gateIndex >= gateSize("radioOut$o")) {
+    EV << "Satellite " << satelliteId << " dropping packet - invalid gate " << gateIndex << endl;
+    packetsDropped++;
+    delete msg;
+    return;
+  }
+
+  cGate *outGate = gate("radioOut$o", gateIndex);
+  if (!outGate->isConnected()) {
+    EV << "Satellite " << satelliteId << " dropping packet - gate " << gateIndex << " not connected" << endl;
+    packetsDropped++;
+    delete msg;
+    return;
+  }
+
   if (txQueue->getLength() >= maxQueueSize) {
     EV << "Tx Queue Full! Dropping packet " << msg->getName() << endl;
     packetsDropped++;
     delete msg;
     return;
   }
+
   msg->setContextPointer((void *)(intptr_t)gateIndex);
   txQueue->insert(msg);
   processTxQueue();
@@ -207,28 +177,39 @@ void Satellite::processTxQueue() {
 
   cMessage *msg = (cMessage *)txQueue->front();
   int gateIndex = (int)(intptr_t)msg->getContextPointer();
+
+  // Check if gate index is valid
+  if (gateIndex < 0 || gateIndex >= gateSize("radioOut$o")) {
+    EV << "Satellite " << satelliteId << " dropping packet - invalid gate index " << gateIndex << endl;
+    txQueue->pop();
+    packetsDropped++;
+    delete msg;
+    return;
+  }
+
   cGate *outGate = gate("radioOut$o", gateIndex);
+
+  // Check if gate is connected (dynamic links may have been disconnected)
+  if (!outGate->isConnected()) {
+    EV << "Satellite " << satelliteId << " dropping packet - gate " << gateIndex << " disconnected (handover)" << endl;
+    txQueue->pop();
+    packetsDropped++;
+    delete msg;
+    return;
+  }
+
   cChannel *chan = outGate->getTransmissionChannel();
 
   if (chan && chan->isBusy()) {
     // Channel busy. Wait until it finishes.
     simtime_t finishTime = chan->getTransmissionFinishTime();
 
-    // DEBUG
-    // EV << "DEBUG: Channel BUSY until " << finishTime << ". Queue len: " <<
-    // txQueue->getLength() << endl;
-
     if (!txFinishTimer->isScheduled()) {
       scheduleAt(finishTime, txFinishTimer);
     }
   } else {
     // Channel free! Send it.
-    txQueue->pop(); // Remove from queue
-
-    // DEBUG
-    // EV << "DEBUG: Sending packet " << msg->getName() << " Size: " <<
-    // ((cPacket*)msg)->getBitLength() << " bits" << endl;
-
+    txQueue->pop();
     send(msg, "radioOut$o", gateIndex);
   }
 }
@@ -237,50 +218,42 @@ void Satellite::finish() {
   if (updateTimer) {
     cancelAndDelete(updateTimer);
   }
-  if (trafficTimer) {
-    cancelAndDelete(trafficTimer);
-  }
   if (txFinishTimer) {
     cancelAndDelete(txFinishTimer);
   }
   delete txQueue;
 
-  // statistics
-  EV << "=== Satellite " << satelliteId << " Statistics ===" << endl;
-  EV << "Packets Received: " << packetsReceived << endl;
+  // === ROUTER STATISTICS ===
+  EV << "=== Satellite " << satelliteId << " (ROUTER) Statistics ===" << endl;
   EV << "Packets Forwarded: " << packetsForwarded << endl;
   EV << "Packets Dropped: " << packetsDropped << endl;
-  EV << "Total Packets Processed: "
-     << (packetsReceived + packetsForwarded + packetsDropped) << endl;
 
-  // --- New Statistics: Throughput & PDR ---
+  long totalPackets = packetsForwarded + packetsDropped;
+  EV << "Total Packets Handled: " << totalPackets << endl;
+
+  // --- Router Throughput ---
   double simDuration = simTime().dbl();
-  
-  // Calculate active duration
   double activeDuration = (lastPacketTime - firstPacketTime).dbl();
-  if (activeDuration <= 0.001) { 
-      // Fallback if only 1 packet or instant bursts
-      activeDuration = simDuration; 
+  if (activeDuration <= 0.001) {
+      activeDuration = simDuration;
   }
 
-  double throughputBps =
-      (activeDuration > 0) ? (double)totalBitsReceived / activeDuration : 0.0;
+  double forwardThroughputBps =
+      (activeDuration > 0) ? (double)totalBitsForwarded / activeDuration : 0.0;
 
-  // --- FIX PDR CALCULATION ---
-  // Satellites are routers. Success means Receiving OR Forwarding.
-  long totalSuccess = packetsReceived + packetsForwarded;
-  long totalAttempts = totalSuccess + packetsDropped;
-  
-  // If satellite was idle (0 packets), consider it 100% healthy (1.0), not 0% broken.
-  double pdr = (totalAttempts > 0) ? (double)totalSuccess / totalAttempts : 1.0;
+  // --- Forward Success Rate ---
+  // How many packets were successfully forwarded vs dropped
+  double forwardSuccessRate = (totalPackets > 0)
+      ? (double)packetsForwarded / totalPackets
+      : 1.0;
 
-  EV << "Throughput: " << throughputBps << " bps" << endl;
-  EV << "PDR: " << pdr * 100.0 << " %" << endl;
+  EV << "Forward Throughput: " << forwardThroughputBps / 1000000.0 << " Mbps" << endl;
+  EV << "Forward Success Rate: " << forwardSuccessRate * 100.0 << " %" << endl;
 
-  // Record scalars for OMNeT++ Analysis (.anf)
-  recordScalar("Throughput_bps", throughputBps);
-  recordScalar("PacketDeliveryRatio", pdr);
-  recordScalar("PacketsReceived", packetsReceived);
+  // Record scalars for OMNeT++ Analysis
+  recordScalar("ForwardThroughput_bps", forwardThroughputBps);
+  recordScalar("ForwardSuccessRate", forwardSuccessRate);
+  recordScalar("PacketsForwarded", packetsForwarded);
   recordScalar("PacketsDropped", packetsDropped);
 
   if (hopCountHist->getCount() > 0) {
@@ -344,36 +317,50 @@ void Satellite::updateNeighborList() {
     cGate *destGate = outGate->getPathEndGate();
     cModule *destMod = destGate->getOwnerModule();
 
-    // Check if it is a Satellite
+    // Check if it is a Satellite (ISL - Inter-Satellite Link)
     if (strcmp(destMod->getClassName(), "Satellite") == 0) {
       double distance = calculateDistanceToSatellite(destMod);
+
+      // Update ISL channel delay based on real distance
+      cChannel *channel = outGate->getChannel();
+      if (channel) {
+        // delay = distance / speed_of_light + processing
+        double propagationDelay = distance / 299792.458;  // km / (km/s) = seconds
+        double processingDelay = 0.001;  // 1ms processing delay
+        double totalDelay = propagationDelay + processingDelay;
+        channel->par("delay").setDoubleValue(totalDelay);
+      }
 
       // Only add to routing table if within range (simulating link break)
       if (distance <= maxISLRange) {
         NeighborInfo neighbor;
         neighbor.module = destMod;
         neighbor.distance = distance;
-        neighbor.gateIndex = i; // The actual gate index!
+        neighbor.gateIndex = i;
         neighbors.push_back(neighbor);
       }
     }
     // Or GroundStation
     else if (strcmp(destMod->getClassName(), "GroundStation") == 0) {
-      // Add GS to neighbor list so we can route TO it
-      // Distance check is managed by GS side mostly, but if we are connected
-      // via channel, it's valid.
-      double distance = 500.0; // Assume link length roughly
+      // Calculate real distance to GS
+      GeoCoord gsGeo;
+      gsGeo.latitude = destMod->par("latitude").doubleValue();
+      gsGeo.longitude = destMod->par("longitude").doubleValue();
+      gsGeo.altitude = destMod->par("altitude").doubleValue();
+      Position3D gsPos = geoToECEF(gsGeo);
+      double distance = calculateDistance(currentPosition, gsPos);
+
       NeighborInfo neighbor;
       neighbor.module = destMod;
       neighbor.distance = distance;
       neighbor.gateIndex = i;
       neighbors.push_back(neighbor);
 
-      // Add to Routing Table immediately
+      // Add to Routing Table
       int gsAddr = destMod->par("address").intValue();
       RoutingEntry entry;
       entry.destinationId = gsAddr;
-      entry.nextHopId = gsAddr; // Direct connection
+      entry.nextHopId = gsAddr;
       entry.cost = distance;
       routingTable.push_back(entry);
     }

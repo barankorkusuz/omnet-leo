@@ -7,3 +7,4 @@ simulations/results/
 simulations/.qtenvrc
 my-leo
 Makefile
+analysis_output/
